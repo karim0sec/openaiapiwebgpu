@@ -1,0 +1,20 @@
+{
+  "name": "llmwebgpu",
+  "module": "index.ts",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "start": "bun run index.ts",
+    "dev": "bun run index.ts"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "@huggingface/responses.js": "huggingface/responses.js",
+    "@huggingface/transformers": "^4.0.0-next.4"
+  }
+}
