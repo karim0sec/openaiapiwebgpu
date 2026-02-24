@@ -1,23 +1,28 @@
-/**
- * GET /v1/models - OpenAI-compatible model list.
- */
+import { getModelAlias, isModelLoaded, getModelId } from '../lib/pipeline.js';
+import type { ModelList } from '../lib/types.js';
 
-import type { ModelsListResponse } from "../types.js";
-import type { InferenceEngine } from "../model/InferenceEngine.js";
-
-export function handleGetModels(engine: InferenceEngine): ModelsListResponse {
+export function handleModels(): ModelList {
+  const modelAlias = getModelAlias();
+  
   return {
-    object: "list",
+    object: 'list',
     data: [
       {
-        id: engine.modelId,
-        object: "model",
-        created: Math.floor(Date.now() / 1000),
-        owned_by: "llmwebgpu",
-        meta: engine.isReady
-          ? { status: "loaded" }
-          : { status: "loading" },
+        id: modelAlias,
+        object: 'model',
+        owned_by: 'me',
+        permissions: [],
       },
     ],
+  };
+}
+
+export function getModelInfo() {
+  return {
+    id: getModelAlias(),
+    object: 'model',
+    owned_by: 'me',
+    permissions: [],
+    ready: isModelLoaded(),
   };
 }

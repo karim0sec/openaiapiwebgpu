@@ -1,150 +1,196 @@
-/**
- * HTTP server exposing OpenAI-compatible API (llama.server style).
- */
+import { handleModels } from './routes/models.js';
+import { handleChatCompletion } from './routes/chat.js';
+import { handleCompletion } from './routes/completions.js';
+import { handleResponses } from './routes/responses.js';
+import { handleEmbeddings } from './routes/embeddings.js';
+import { handleError, ApiError, UnauthorizedError } from './lib/errors.js';
+import { isModelLoaded, getModelAlias } from './lib/pipeline.js';
+import { config } from './config.js';
+import type { ChatCompletionRequest, CompletionRequest, EmbeddingRequest, ResponsesRequest } from './lib/types.js';
 
-import type { InferenceEngine } from "./model/InferenceEngine.js";
-import type { ToolExecutor } from "./tools/ToolExecutor.js";
-import { handleGetModels } from "./routes/models.js";
-import { handleChatCompletion } from "./routes/chat.js";
-import { handleCompletion } from "./routes/completions.js";
-import type { ChatCompletionRequest, CompletionRequest } from "./types.js";
+const corsHeaders = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+};
 
-export interface ServerConfig {
-  port: number;
-  host?: string;
+function getAuthToken(): string | undefined {
+  return process.env.API_KEY || config.apiKey;
 }
 
-export class ApiServer {
-  constructor(
-    private readonly engine: InferenceEngine,
-    private readonly toolExecutor: ToolExecutor,
-    private readonly config: ServerConfig
-  ) {}
-
-  /** Return proper error response without crashing. Model OOM → 503, bad request → 400. */
-  private errorResponse(err: unknown): Response {
-    const msg = err instanceof Error ? err.message : String(err);
-    const isModelError = /memory|OOM|buffer|WebGPU|Vulkan|device_memory|download/i.test(msg);
-    const status = isModelError ? 503 : 400;
-    const type = isModelError ? "model_error" : "invalid_request_error";
-    console.error(`[ApiServer] ${type}:`, msg);
-    return Response.json(
-      { error: { message: msg, type } },
-      { status }
-    );
+function checkAuth(headers: Headers): boolean {
+  const authToken = getAuthToken();
+  if (!authToken) {
+    return true;
   }
 
-  private async handleRequest(req: Request): Promise<Response> {
-    const url = new URL(req.url);
-    const path = url.pathname;
-    const method = req.method;
-    console.log(`[ApiServer] ${method} ${path}`);
+  const authHeader = headers.get('Authorization');
+  if (!authHeader) {
+    return false;
+  }
 
-    if (path === "/v1/health" || path === "/health") {
-      return Response.json({ status: "ok", model: this.engine.modelId });
-    }
+  const token = authHeader.replace('Bearer ', '');
+  return token === authToken;
+}
 
-    if (method === "GET" && path === "/v1/models") {
-      const body = handleGetModels(this.engine);
-      return Response.json(body);
-    }
+export async function createServer() {
+  const server = Bun.serve({
+    port: config.port,
+    hostname: config.host,
 
-    if (method === "POST" && path === "/v1/completions") {
-      try {
-        const body = (await req.json()) as CompletionRequest;
-        const response = await handleCompletion(this.engine, body);
-        return Response.json(response);
-      } catch (err) {
-        return this.errorResponse(err);
+    async fetch(req) {
+      const url = new URL(req.url);
+      const path = config.rootPath 
+        ? url.pathname.replace(config.rootPath, '') 
+        : url.pathname;
+      const method = req.method;
+
+      if (method === 'OPTIONS') {
+        return new Response(null, { headers: corsHeaders });
       }
-    }
 
-    if (method === "POST" && path === "/v1/chat/completions") {
+      if (!checkAuth(req.headers)) {
+        return new Response(JSON.stringify({
+          error: {
+            message: 'Invalid API key',
+            type: 'invalid_request_error',
+            code: 'invalid_api_key',
+          },
+        }), {
+          status: 401,
+          headers: { 'Content-Type': 'application/json', ...corsHeaders },
+        });
+      }
+
       try {
-        const body = (await req.json()) as ChatCompletionRequest;
-        const stream = body.stream === true;
-
-        if (stream) {
-          return await this.handleStreamingChat(body);
+        if (path === '/health') {
+          return new Response(JSON.stringify({
+            status: 'ok',
+            model_loaded: isModelLoaded(),
+            model: getModelAlias(),
+          }), {
+            headers: { 'Content-Type': 'application/json', ...corsHeaders },
+          });
         }
 
-        const response = await handleChatCompletion(
-          this.engine,
-          this.toolExecutor,
-          body
-        );
-        return Response.json(response);
-      } catch (err) {
-        return this.errorResponse(err);
+        if (path === '/v1/models' && method === 'GET') {
+          const models = handleModels();
+          return new Response(JSON.stringify(models), {
+            headers: { 'Content-Type': 'application/json', ...corsHeaders },
+          });
+        }
+
+        if (path === '/v1/chat/completions' && method === 'POST') {
+          const body = await req.json() as ChatCompletionRequest;
+          const result = await handleChatCompletion(body);
+          
+          if (!body.stream) {
+            return new Response(JSON.stringify(result), {
+              headers: { 'Content-Type': 'application/json', ...corsHeaders },
+            });
+          }
+
+          const streamFn = result as (controller: ReadableStreamDefaultController) => void;
+          
+          const stream = new ReadableStream({
+            start(controller) {
+              streamFn(controller);
+            },
+          });
+
+          return new Response(stream, {
+            headers: {
+              'Content-Type': 'text/event-stream',
+              'Cache-Control': 'no-cache',
+              'Connection': 'keep-alive',
+              ...corsHeaders,
+            },
+          });
+        }
+
+        if (path === '/v1/completions' && method === 'POST') {
+          const body = await req.json() as CompletionRequest;
+          const result = await handleCompletion(body);
+          
+          if (!body.stream) {
+            return new Response(JSON.stringify(result), {
+              headers: { 'Content-Type': 'application/json', ...corsHeaders },
+            });
+          }
+
+          const streamFn = result as (controller: ReadableStreamDefaultController) => void;
+          
+          const stream = new ReadableStream({
+            start(controller) {
+              streamFn(controller);
+            },
+          });
+
+          return new Response(stream, {
+            headers: {
+              'Content-Type': 'text/event-stream',
+              'Cache-Control': 'no-cache',
+              'Connection': 'keep-alive',
+              ...corsHeaders,
+            },
+          });
+        }
+
+        if (path === '/v1/embeddings' && method === 'POST') {
+          const body = await req.json() as EmbeddingRequest;
+          const result = await handleEmbeddings(body);
+          return new Response(JSON.stringify(result), {
+            headers: { 'Content-Type': 'application/json', ...corsHeaders },
+          });
+        }
+
+        if (path === '/v1/responses' && method === 'POST') {
+          const body = await req.json() as ResponsesRequest;
+          const result = await handleResponses(body);
+          
+          if (!body.stream) {
+            return new Response(JSON.stringify(result), {
+              headers: { 'Content-Type': 'application/json', ...corsHeaders },
+            });
+          }
+
+          const streamFn = result as (controller: ReadableStreamDefaultController) => void;
+          
+          const stream = new ReadableStream({
+            start(controller) {
+              streamFn(controller);
+            },
+          });
+
+          return new Response(stream, {
+            headers: {
+              'Content-Type': 'text/event-stream',
+              'Cache-Control': 'no-cache',
+              'Connection': 'keep-alive',
+              ...corsHeaders,
+            },
+          });
+        }
+
+        return new Response(JSON.stringify({
+          error: {
+            message: `Not found: ${path}`,
+            type: 'invalid_request_error',
+          },
+        }), {
+          status: 404,
+          headers: { 'Content-Type': 'application/json', ...corsHeaders },
+        });
+
+      } catch (error) {
+        const apiError = handleError(error);
+        return new Response(JSON.stringify(apiError.toJSON()), {
+          status: apiError.status,
+          headers: { 'Content-Type': 'application/json', ...corsHeaders },
+        });
       }
-    }
+    },
+  });
 
-    return new Response(
-      JSON.stringify({
-        error: {
-          message: `Not found: ${method} ${path}`,
-          type: "invalid_request_error",
-        },
-      }),
-      { status: 404, headers: { "Content-Type": "application/json" } }
-    );
-  }
-
-  /** Streaming: for now, buffer and send single chunk. Full SSE can be added later. */
-  private async handleStreamingChat(body: ChatCompletionRequest): Promise<Response> {
-    const nonStreamBody = { ...body, stream: false };
-    let response;
-    try {
-      response = await handleChatCompletion(
-        this.engine,
-        this.toolExecutor,
-        nonStreamBody
-      );
-    } catch (err) {
-      return this.errorResponse(err);
-    }
-
-    const chunk = {
-      id: response.id,
-      object: "chat.completion.chunk" as const,
-      created: response.created,
-      model: response.model,
-      choices: [
-        {
-          index: 0,
-          delta: { role: "assistant" as const, content: response.choices[0].message.content },
-          finish_reason: "stop",
-        },
-      ],
-      system_fingerprint: response.system_fingerprint,
-    };
-
-    const encoder = new TextEncoder();
-    const data = `data: ${JSON.stringify(chunk)}\n\ndata: [DONE]\n\n`;
-
-    return new Response(encoder.encode(data), {
-      headers: {
-        "Content-Type": "text/event-stream",
-        "Cache-Control": "no-cache",
-        Connection: "keep-alive",
-      },
-    });
-  }
-
-  listen(): void {
-    const host = this.config.host ?? "0.0.0.0";
-    const port = this.config.port;
-
-    const server = Bun.serve({
-      host,
-      port,
-      fetch: (req) => this.handleRequest(req),
-    });
-
-    console.log(`[ApiServer] OpenAI-compatible API: http://${host}:${port}`);
-    console.log(`[ApiServer] GET  /v1/models`);
-    console.log(`[ApiServer] POST /v1/completions`);
-    console.log(`[ApiServer] POST /v1/chat/completions`);
-    console.log(`[ApiServer] GET  /v1/health`);
-  }
+  return server;
 }

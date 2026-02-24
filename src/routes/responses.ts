@@ -1,23 +1,22 @@
-import { generate, getPipeline, isModelLoaded, getModelAlias } from '../lib/pipeline.js';
+import { generate, isModelLoaded, getModelAlias } from '../lib/pipeline.js';
 import { BadRequestError, ServiceUnavailableError } from '../lib/errors.js';
-import type { ChatCompletionRequest, ChatCompletionResponse, ChatCompletionChunk, ChatMessage } from '../lib/types.js';
-import { config } from '../config.js';
+import type { ResponsesRequest, ResponsesResponse, ResponsesChunk, ResponseInputItem } from '../lib/types.js';
 
 let requestId = 0;
 
 function generateId(): string {
-  return `chatcmpl-${(++requestId).toString(36)}`;
+  return `resp_${(++requestId).toString(36)}${Date.now().toString(36)}`;
 }
 
-export async function handleChatCompletion(
-  body: ChatCompletionRequest
-): Promise<ChatCompletionResponse | ((controller: ReadableStreamDefaultController) => void)> {
+export async function handleResponses(
+  body: ResponsesRequest
+): Promise<ResponsesResponse | ((controller: ReadableStreamDefaultController) => void)> {
   if (!isModelLoaded()) {
     throw new ServiceUnavailableError('Model not loaded. Please wait for the model to load.');
   }
 
   const model = body.model;
-  const messages = body.messages;
+  const input = body.input;
   const stream = body.stream ?? false;
   const maxTokens = body.max_tokens ?? 256;
   const temperature = body.temperature ?? 0.8;
@@ -27,34 +26,55 @@ export async function handleChatCompletion(
   const repeatPenalty = body.repeat_penalty ?? 1.1;
   const stop = body.stop ?? [];
 
-  if (!messages || messages.length === 0) {
-    throw new BadRequestError('messages is required');
+  if (!input) {
+    throw new BadRequestError('input is required');
   }
 
-  const chatPrompt = convertMessagesToPrompt(messages);
+  const prompt = convertInputToPrompt(input);
 
   if (stream) {
-    return createStreamingResponse(chatPrompt, model, maxTokens, temperature, topP, topK, minP, repeatPenalty, stop);
+    return createStreamingResponse(prompt, model, maxTokens, temperature, topP, topK, minP, repeatPenalty, stop);
   }
 
-  return generateCompletion(chatPrompt, model, maxTokens, temperature, topP, topK, minP, repeatPenalty, stop);
+  return generateCompletion(prompt, model, maxTokens, temperature, topP, topK, minP, repeatPenalty, stop);
 }
 
-function convertMessagesToPrompt(messages: ChatMessage[]): string {
-  const systemMessages = messages.filter(m => m.role === 'system');
-  const nonSystemMessages = messages.filter(m => m.role !== 'system');
+function extractTextContent(content: string | ResponseInputItem[]): string {
+  if (typeof content === 'string') {
+    return content;
+  }
+  if (Array.isArray(content)) {
+    return content
+      .map((c: any) => c.text || '')
+      .join('');
+  }
+  return '';
+}
 
+function convertInputToPrompt(input: ResponseInputItem | ResponseInputItem[]): string {
   let prompt = '';
   
-  if (systemMessages.length > 0 && systemMessages[0]) {
-    prompt += `System: ${systemMessages[0].content}\n\n`;
-  }
-
-  for (const msg of nonSystemMessages) {
-    if (msg.role === 'user') {
-      prompt += `User: ${msg.content}\n\n`;
-    } else if (msg.role === 'assistant') {
-      prompt += `Assistant: ${msg.content}\n\n`;
+  const items = Array.isArray(input) ? input : [input];
+  
+  for (const item of items) {
+    if (typeof item === 'string') {
+      prompt += `User: ${item}\n\n`;
+    } else if (item && typeof item === 'object') {
+      const anyItem = item as any;
+      if (anyItem.type === 'input_text') {
+        prompt += `User: ${anyItem.text}\n\n`;
+      } else if (anyItem.type === 'message') {
+        const role = anyItem.role;
+        const content = extractTextContent(anyItem.content);
+        
+        if (role === 'system' || role === 'developer') {
+          prompt += `System: ${content}\n\n`;
+        } else if (role === 'user') {
+          prompt += `User: ${content}\n\n`;
+        } else if (role === 'assistant') {
+          prompt += `Assistant: ${content}\n\n`;
+        }
+      }
     }
   }
 
@@ -73,7 +93,7 @@ async function generateCompletion(
   minP: number,
   repeatPenalty: number,
   stop: string[]
-): Promise<ChatCompletionResponse> {
+): Promise<ResponsesResponse> {
   const result = await generate(prompt, {
     max_new_tokens: maxTokens,
     temperature,
@@ -91,7 +111,7 @@ async function generateCompletion(
     if (typeof genText === 'string') {
       assistantMessage = genText;
     } else if (Array.isArray(genText)) {
-      assistantMessage = genText.map((t: any) => typeof t === 'string' ? t : t.content || '').join('');
+      assistantMessage = genText.map((t: unknown) => typeof t === 'string' ? t : (t as { content?: string }).content || '').join('');
     }
   }
 
@@ -110,17 +130,20 @@ async function generateCompletion(
 
   return {
     id: generateId(),
-    object: 'chat.completion',
+    object: 'response',
     created: Math.floor(Date.now() / 1000),
     model: getModelAlias(),
-    choices: [
+    output: [
       {
-        index: 0,
-        message: {
-          role: 'assistant',
-          content: assistantMessage,
-        },
-        finish_reason: 'stop',
+        type: 'message',
+        id: `msg_${Date.now().toString(36)}`,
+        role: 'assistant',
+        content: [
+          {
+            type: 'output_text',
+            text: assistantMessage,
+          },
+        ],
       },
     ],
     usage: {
@@ -145,11 +168,13 @@ function createStreamingResponse(
   return async (controller: ReadableStreamDefaultController) => {
     const id = generateId();
     const created = Math.floor(Date.now() / 1000);
+    const messageId = `msg_${Date.now().toString(36)}`;
     let buffer = '';
     let tokensGenerated = 0;
     const maxTokensToGenerate = maxTokens;
 
     try {
+      const { getPipeline } = await import('../lib/pipeline.js');
       const pipe = await getPipeline();
       
       const result = await pipe(prompt, {
@@ -161,11 +186,11 @@ function createStreamingResponse(
         repetition_penalty: repeatPenalty,
         do_sample: temperature > 0,
         return_full_text: false,
-      }) as any;
+      }) as unknown as { 0?: { generated_text: string | string[] } }[];
 
       const fullText = Array.isArray(result) 
-        ? result[0]?.generated_text 
-        : result?.generated_text?.[0]?.generated_text ?? '';
+        ? (result[0]?.generated_text ?? '')
+        : (result?.generated_text?.[0]?.generated_text ?? '');
 
       for (let i = 0; i < fullText.length; i++) {
         const currentText = fullText.slice(0, i + 1);
@@ -174,18 +199,22 @@ function createStreamingResponse(
         tokensGenerated++;
 
         if (newText) {
-          const chunkResponse: ChatCompletionChunk = {
+          const chunkResponse: ResponsesChunk = {
             id,
-            object: 'chat.completion.chunk',
+            object: 'response',
             created,
             model: getModelAlias(),
-            choices: [
+            output: [
               {
-                index: 0,
+                type: 'message_delta',
+                id: messageId,
                 delta: {
+                  role: 'assistant',
                   content: newText,
                 },
-                finish_reason: null,
+                usage: {
+                  output_tokens: tokensGenerated,
+                },
               },
             ],
           };
@@ -195,16 +224,19 @@ function createStreamingResponse(
 
           for (const stopSeq of stop) {
             if (newText.includes(stopSeq)) {
-              const doneChunk: ChatCompletionChunk = {
+              const doneChunk: ResponsesChunk = {
                 id,
-                object: 'chat.completion.chunk',
+                object: 'response',
                 created,
                 model: getModelAlias(),
-                choices: [
+                output: [
                   {
-                    index: 0,
+                    type: 'message_delta',
+                    id: messageId,
                     delta: {},
-                    finish_reason: 'stop',
+                    usage: {
+                      output_tokens: tokensGenerated,
+                    },
                   },
                 ],
               };
@@ -217,16 +249,19 @@ function createStreamingResponse(
         }
 
         if (tokensGenerated >= maxTokensToGenerate) {
-          const doneChunk: ChatCompletionChunk = {
+          const doneChunk: ResponsesChunk = {
             id,
-            object: 'chat.completion.chunk',
+            object: 'response',
             created,
             model: getModelAlias(),
-            choices: [
+            output: [
               {
-                index: 0,
+                type: 'message_delta',
+                id: messageId,
                 delta: {},
-                finish_reason: 'length',
+                usage: {
+                  output_tokens: tokensGenerated,
+                },
               },
             ],
           };
